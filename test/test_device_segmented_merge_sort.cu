@@ -29,6 +29,7 @@
 #define CUB_STDERR
 
 #include <cub/device/device_segmented_merge_sort.cuh>
+#include <cub/util_allocator.cuh>
 #include <test_util.h>
 
 #include <thrust/device_vector.h>
@@ -44,6 +45,12 @@
 // %PARAM% TEST_VALUE_T vt 0:1:2:3
 
 using namespace cub;
+
+//---------------------------------------------------------------------
+// Globals
+//---------------------------------------------------------------------
+CachingDeviceAllocator g_allocator(true);
+bool g_verbose = false;
 
 constexpr static int MAX_ITERATIONS = 3;
 
