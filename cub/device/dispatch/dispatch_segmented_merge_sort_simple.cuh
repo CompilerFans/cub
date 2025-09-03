@@ -27,7 +27,7 @@
 
 #pragma once
 
-#include <cub/agent/agent_segmented_merge_sort_fixed.cuh>
+#include <cub/agent/agent_segmented_merge_sort_final.cuh>
 #include <cub/util_debug.cuh>
 #include <cub/util_device.cuh>
 #include <cub/util_namespace.cuh>
@@ -64,7 +64,7 @@ __global__ void DeviceSegmentedMergeSortKernel(
     EndOffsetIteratorT d_end_offsets,
     int num_segments)
 {
-  using AgentT = AgentSegmentedMergeSortFixed<IS_DESCENDING,
+  using AgentT = AgentSegmentedMergeSortFinal<IS_DESCENDING,
                                              SimpleMergeSortPolicy,
                                              KeyT,
                                              ValueT,
@@ -110,6 +110,7 @@ struct DispatchSegmentedMergeSortSimple
            EndOffsetIteratorT d_end_offsets,
            cudaStream_t stream)
   {
+    (void)num_items; // Suppress unused parameter warning
     cudaError error = cudaSuccess;
 
     do

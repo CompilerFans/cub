@@ -27,352 +27,176 @@
 
 #pragma once
 
-#include <cub/block/block_load.cuh>
 #include <cub/block/block_merge_sort.cuh>
+#include <cub/block/block_load.cuh>
 #include <cub/block/block_store.cuh>
 #include <cub/config.cuh>
 #include <cub/util_namespace.cuh>
 #include <cub/util_type.cuh>
-#include <cub/warp/warp_merge_sort.cuh>
+#include <cub/thread/thread_operators.cuh>
+#include <cub/thread/thread_sort.cuh>
 
 CUB_NAMESPACE_BEGIN
 
 /**
- * @brief Agent for segmented merge sort
- *
- * @tparam IS_DESCENDING
- *   Whether or not the sorted-order is high-to-low
- *
- * @tparam PolicyT
- *   Parameterized tuning policy type
- *
- * @tparam KeyT
- *   Key type
- *
- * @tparam ValueT
- *   Value type
- *
- * @tparam OffsetT
- *   Signed integer type for global offsets
- *
- * @tparam CompareOpT
- *   Binary comparison function object type
+ * @brief Agent for segmented merge sort operations
  */
 template <bool IS_DESCENDING,
           typename PolicyT,
           typename KeyT,
           typename ValueT,
-          typename OffsetT,
-          typename CompareOpT>
+          typename OffsetT>
 struct AgentSegmentedMergeSort
 {
   //---------------------------------------------------------------------
-  // Constants
+  // Constants and type definitions
   //---------------------------------------------------------------------
 
   static constexpr int BLOCK_THREADS    = PolicyT::BLOCK_THREADS;
   static constexpr int ITEMS_PER_THREAD = PolicyT::ITEMS_PER_THREAD;
-  static constexpr int TILE_SIZE        = BLOCK_THREADS * ITEMS_PER_THREAD;
   static constexpr bool KEYS_ONLY       = std::is_same<ValueT, NullType>::value;
+  static constexpr int TILE_SIZE        = BLOCK_THREADS * ITEMS_PER_THREAD;
 
-  //---------------------------------------------------------------------
-  // Type definitions
-  //---------------------------------------------------------------------
+  using BlockMergeSortT = BlockMergeSort<KeyT, BLOCK_THREADS, ITEMS_PER_THREAD, ValueT>;
+  using BlockLoadKeysT  = BlockLoad<KeyT, BLOCK_THREADS, ITEMS_PER_THREAD, BLOCK_LOAD_TRANSPOSE>;
+  using BlockStoreKeysT = BlockStore<KeyT, BLOCK_THREADS, ITEMS_PER_THREAD, BLOCK_STORE_TRANSPOSE>;
+  
+  using BlockLoadValuesT  = BlockLoad<ValueT, BLOCK_THREADS, ITEMS_PER_THREAD, BLOCK_LOAD_TRANSPOSE>;
+  using BlockStoreValuesT = BlockStore<ValueT, BLOCK_THREADS, ITEMS_PER_THREAD, BLOCK_STORE_TRANSPOSE>;
 
-  using BlockMergeSortT = BlockMergeSort<KeyT, 
-                                        BLOCK_THREADS, 
-                                        ITEMS_PER_THREAD, 
-                                        ValueT>;
-
-  using BlockLoadKeysT = BlockLoad<KeyT, 
-                                  BLOCK_THREADS, 
-                                  ITEMS_PER_THREAD, 
-                                  BLOCK_LOAD_TRANSPOSE>;
-
-  using BlockLoadValuesT = BlockLoad<ValueT, 
-                                    BLOCK_THREADS, 
-                                    ITEMS_PER_THREAD, 
-                                    BLOCK_LOAD_TRANSPOSE>;
-
-  using BlockStoreKeysT = BlockStore<KeyT, 
-                                    BLOCK_THREADS, 
-                                    ITEMS_PER_THREAD, 
-                                    BLOCK_STORE_TRANSPOSE>;
-
-  using BlockStoreValuesT = BlockStore<ValueT, 
-                                      BLOCK_THREADS, 
-                                      ITEMS_PER_THREAD, 
-                                      BLOCK_STORE_TRANSPOSE>;
-
-  using WarpMergeSortT = WarpMergeSort<KeyT, 
-                                      ITEMS_PER_THREAD, 
-                                      CUB_PTX_WARP_THREADS, 
-                                      ValueT>;
+  /**
+   * @brief Standard comparison operator
+   */
+  struct CompareOp
+  {
+    __device__ __forceinline__ bool operator()(const KeyT &a, const KeyT &b) const
+    {
+      return IS_DESCENDING ? (a > b) : (a < b);
+    }
+  };
 
   //---------------------------------------------------------------------
   // Per-thread fields
   //---------------------------------------------------------------------
 
+  OffsetT segment_begin;
+  OffsetT segment_end;
   OffsetT num_items;
-  CompareOpT compare_op;
 
   //---------------------------------------------------------------------
   // Shared memory storage
   //---------------------------------------------------------------------
 
-  union _TempStorage
+  union TempStorage
   {
-    typename BlockMergeSortT::TempStorage block_merge_sort;
-    
-    struct LoadStore
-    {
-      union
-      {
-        typename BlockLoadKeysT::TempStorage load_keys;
-        typename BlockStoreKeysT::TempStorage store_keys;
-      };
-      
-      union
-      {
-        typename BlockLoadValuesT::TempStorage load_values;
-        typename BlockStoreValuesT::TempStorage store_values;
-      };
-    } load_store;
-
-    typename WarpMergeSortT::TempStorage warp_merge_sort[BLOCK_THREADS / CUB_PTX_WARP_THREADS];
+    typename BlockMergeSortT::TempStorage    sort;
+    typename BlockLoadKeysT::TempStorage     load_keys;
+    typename BlockStoreKeysT::TempStorage    store_keys;
+    typename BlockLoadValuesT::TempStorage   load_values;
+    typename BlockStoreValuesT::TempStorage  store_values;
   };
 
-  using TempStorage = Uninitialized<_TempStorage>;
-  _TempStorage &temp_storage;
+  TempStorage &temp_storage;
 
   //---------------------------------------------------------------------
   // Constructor
   //---------------------------------------------------------------------
 
   __device__ __forceinline__
-  AgentSegmentedMergeSort(OffsetT num_items,
-                          TempStorage &temp_storage,
-                          CompareOpT compare_op)
-      : num_items(num_items)
-      , compare_op(compare_op)
-      , temp_storage(temp_storage.Alias())
+  AgentSegmentedMergeSort(OffsetT segment_begin,
+                          OffsetT segment_end,
+                          TempStorage &temp_storage)
+      : segment_begin(segment_begin)
+      , segment_end(segment_end)  
+      , num_items(segment_end - segment_begin)
+      , temp_storage(temp_storage)
   {}
 
   //---------------------------------------------------------------------
-  // Block-wide merge sort for a single segment
+  // Utility functions
   //---------------------------------------------------------------------
 
-  __device__ __forceinline__ void
-  BlockSortFullTile(const KeyT *d_keys_in,
-                    KeyT *d_keys_out,
-                    const ValueT *d_values_in,
-                    ValueT *d_values_out)
+  /**
+   * @brief Get appropriate out-of-bounds sentinel value that won't interfere with sorting
+   */
+  __device__ __forceinline__ KeyT GetSentinelValue() const
   {
-    KeyT thread_keys[ITEMS_PER_THREAD];
-    ValueT thread_values[ITEMS_PER_THREAD];
-
-    // Load keys and values
-    BlockLoadKeysT(temp_storage.load_store.load_keys).Load(d_keys_in, thread_keys);
-    __syncthreads();
-
-    if (!KEYS_ONLY)
-    {
-      BlockLoadValuesT(temp_storage.load_store.load_values).Load(d_values_in, thread_values);
-      __syncthreads();
-    }
-
-    // Sort keys and values
     if (IS_DESCENDING)
     {
-      BlockMergeSortT(temp_storage.block_merge_sort).SortDescending(thread_keys, thread_values, compare_op);
+      // For descending sort, use minimum value so it ends up at the end
+      return Traits<KeyT>::Lowest();
     }
     else
     {
-      BlockMergeSortT(temp_storage.block_merge_sort).Sort(thread_keys, thread_values, compare_op);
-    }
-    __syncthreads();
-
-    // Store sorted keys and values
-    BlockStoreKeysT(temp_storage.load_store.store_keys).Store(d_keys_out, thread_keys);
-    __syncthreads();
-
-    if (!KEYS_ONLY)
-    {
-      BlockStoreValuesT(temp_storage.load_store.store_values).Store(d_values_out, thread_values);
-      __syncthreads();
+      // For ascending sort, use maximum value so it ends up at the end
+      return Traits<KeyT>::Max();
     }
   }
 
   //---------------------------------------------------------------------
-  // Block-wide merge sort for a partial tile
+  // Simple load/store operations
   //---------------------------------------------------------------------
 
-  __device__ __forceinline__ void
-  BlockSortPartialTile(const KeyT *d_keys_in,
-                       KeyT *d_keys_out,
-                       const ValueT *d_values_in,
-                       ValueT *d_values_out,
-                       OffsetT valid_items)
+  //---------------------------------------------------------------------
+  // Main processing method
+  //---------------------------------------------------------------------
+  
+  __device__ __forceinline__ void ProcessSegment(
+    const KeyT *d_keys_in,
+    KeyT *d_keys_out,
+    const ValueT *d_values_in,
+    ValueT *d_values_out)
   {
-    KeyT thread_keys[ITEMS_PER_THREAD];
-    ValueT thread_values[ITEMS_PER_THREAD];
-
-    // Load keys and values with bounds checking
-    KeyT oob_default = IS_DESCENDING ? 
-                       std::numeric_limits<KeyT>::lowest() : 
-                       std::numeric_limits<KeyT>::max();
-
-    BlockLoadKeysT(temp_storage.load_store.load_keys).Load(
-        d_keys_in, thread_keys, valid_items, oob_default);
-    __syncthreads();
-
-    if (!KEYS_ONLY)
-    {
-      BlockLoadValuesT(temp_storage.load_store.load_values).Load(
-          d_values_in, thread_values, valid_items);
-      __syncthreads();
-    }
-
-    // Sort keys and values
-    if (IS_DESCENDING)
-    {
-      BlockMergeSortT(temp_storage.block_merge_sort).SortDescending(thread_keys, thread_values, compare_op);
-    }
-    else
-    {
-      BlockMergeSortT(temp_storage.block_merge_sort).Sort(thread_keys, thread_values, compare_op);
-    }
-    __syncthreads();
-
-    // Store sorted keys and values with bounds checking
-    BlockStoreKeysT(temp_storage.load_store.store_keys).Store(
-        d_keys_out, thread_keys, valid_items);
-    __syncthreads();
-
-    if (!KEYS_ONLY)
-    {
-      BlockStoreValuesT(temp_storage.load_store.store_values).Store(
-          d_values_out, thread_values, valid_items);
-      __syncthreads();
-    }
-  }
-
-  //---------------------------------------------------------------------
-  // Warp-wide merge sort for small segments
-  //---------------------------------------------------------------------
-
-  __device__ __forceinline__ void
-  WarpSort(const KeyT *d_keys_in,
-           KeyT *d_keys_out,
-           const ValueT *d_values_in,
-           ValueT *d_values_out,
-           OffsetT valid_items)
-  {
-    const int warp_id = threadIdx.x / CUB_PTX_WARP_THREADS;
-    const int lane_id = threadIdx.x % CUB_PTX_WARP_THREADS;
-
-    // Check if this warp participates
-    if (warp_id * CUB_PTX_WARP_THREADS >= valid_items)
-    {
-      return;
-    }
+    // Early exit for empty segments
+    if (num_items <= 0) return;
 
     KeyT thread_keys[ITEMS_PER_THREAD];
     ValueT thread_values[ITEMS_PER_THREAD];
-
-    // Calculate how many items this warp processes
-    OffsetT warp_offset = warp_id * CUB_PTX_WARP_THREADS * ITEMS_PER_THREAD;
-    OffsetT warp_items = min(static_cast<OffsetT>(CUB_PTX_WARP_THREADS * ITEMS_PER_THREAD), 
-                             valid_items - warp_offset);
-
-    // Load keys for this warp
+    CompareOp compare_op;
+    KeyT oob_default = GetSentinelValue();
+    
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i)
     {
-      OffsetT idx = warp_offset + lane_id + i * CUB_PTX_WARP_THREADS;
-      if (idx < valid_items)
+      OffsetT global_idx = segment_begin + threadIdx.x * ITEMS_PER_THREAD + i;
+      if (global_idx < segment_end)
       {
-        thread_keys[i] = d_keys_in[idx];
+        thread_keys[i] = d_keys_in[global_idx];
         if (!KEYS_ONLY)
-        {
-          thread_values[i] = d_values_in[idx];
-        }
+          thread_values[i] = d_values_in[global_idx];
       }
       else
       {
-        thread_keys[i] = IS_DESCENDING ? 
-                         std::numeric_limits<KeyT>::lowest() : 
-                         std::numeric_limits<KeyT>::max();
+        thread_keys[i] = oob_default;
       }
     }
 
-    // Sort within warp  
-    if (IS_DESCENDING)
+    // Sort using BlockMergeSort with stable sorting
+    BlockMergeSortT block_sort(temp_storage.sort);
+    
+    if (KEYS_ONLY)
     {
-      WarpMergeSortT(temp_storage.warp_merge_sort[warp_id]).SortDescending(thread_keys, thread_values, compare_op);
+      block_sort.StableSort(thread_keys, compare_op, static_cast<int>(num_items), oob_default);
     }
     else
     {
-      WarpMergeSortT(temp_storage.warp_merge_sort[warp_id]).Sort(thread_keys, thread_values, compare_op);
+      block_sort.StableSort(thread_keys, thread_values, compare_op, static_cast<int>(num_items), oob_default);
     }
 
-    // Store sorted data
+    __syncthreads();
+
+    // Store results
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i)
     {
-      OffsetT idx = warp_offset + lane_id + i * CUB_PTX_WARP_THREADS;
-      if (idx < valid_items)
+      OffsetT global_idx = segment_begin + threadIdx.x * ITEMS_PER_THREAD + i;
+      if (global_idx < segment_end)
       {
-        d_keys_out[idx] = thread_keys[i];
+        d_keys_out[global_idx] = thread_keys[i];
         if (!KEYS_ONLY)
-        {
-          d_values_out[idx] = thread_values[i];
-        }
+          d_values_out[global_idx] = thread_values[i];
       }
     }
-  }
-
-  //---------------------------------------------------------------------
-  // Process a single segment
-  //---------------------------------------------------------------------
-
-  __device__ __forceinline__ void
-  ProcessSegment(const KeyT *d_keys_in,
-                 KeyT *d_keys_out,
-                 const ValueT *d_values_in,
-                 ValueT *d_values_out)
-  {
-    // Handle different segment sizes
-    if (num_items <= CUB_PTX_WARP_THREADS * ITEMS_PER_THREAD)
-    {
-      // Small segment: use warp-level sort
-      WarpSort(d_keys_in, d_keys_out, d_values_in, d_values_out, num_items);
-    }
-    else if (num_items == TILE_SIZE)
-    {
-      // Full tile: use optimized full-tile sort
-      BlockSortFullTile(d_keys_in, d_keys_out, d_values_in, d_values_out);
-    }
-    else
-    {
-      // Partial tile: use guarded sort
-      BlockSortPartialTile(d_keys_in, d_keys_out, d_values_in, d_values_out, num_items);
-    }
-  }
-
-  //---------------------------------------------------------------------
-  // Process multiple passes for large segments (future enhancement)
-  //---------------------------------------------------------------------
-
-  __device__ __forceinline__ void
-  ProcessLargeSegment(const KeyT *d_keys_in,
-                      KeyT *d_keys_out,
-                      const ValueT *d_values_in,
-                      ValueT *d_values_out)
-  {
-    // For now, we only handle segments up to TILE_SIZE
-    // Future enhancement: implement multi-pass merge sort for larger segments
-    ProcessSegment(d_keys_in, d_keys_out, d_values_in, d_values_out);
   }
 };
 

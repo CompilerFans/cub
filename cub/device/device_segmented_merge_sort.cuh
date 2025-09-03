@@ -39,7 +39,7 @@
 #include <iterator>
 
 #include <cub/config.cuh>
-#include <cub/device/dispatch/dispatch_segmented_merge_sort_simple.cuh>
+#include <cub/device/dispatch/dispatch_segmented_merge_sort.cuh>
 #include <cub/util_deprecated.cuh>
 
 CUB_NAMESPACE_BEGIN
@@ -95,9 +95,9 @@ struct DeviceSegmentedMergeSort
             cudaStream_t stream = 0)
   {
     // 直接调用内部实现，避免std::less constexpr问题
-    using DispatchT = DispatchSegmentedMergeSortSimple<false, KeyT, ValueT, 
-                                                      BeginOffsetIteratorT, EndOffsetIteratorT, 
-                                                      int>;
+    using DispatchT = DispatchSegmentedMergeSort<false, KeyT, ValueT, 
+                                                BeginOffsetIteratorT, EndOffsetIteratorT, 
+                                                int>;
     
     DoubleBuffer<KeyT> d_keys(const_cast<KeyT*>(d_keys_in), d_keys_out);
     DoubleBuffer<ValueT> d_values(const_cast<ValueT*>(d_values_in), d_values_out);
@@ -128,7 +128,7 @@ struct DeviceSegmentedMergeSort
                       EndOffsetIteratorT d_end_offsets,
                       cudaStream_t stream = 0)
   {
-    using DispatchT = DispatchSegmentedMergeSortSimple<true, KeyT, ValueT, 
+    using DispatchT = DispatchSegmentedMergeSort<true, KeyT, ValueT, 
                                                       BeginOffsetIteratorT, EndOffsetIteratorT, 
                                                       int>;
     
@@ -165,7 +165,7 @@ struct DeviceSegmentedMergeSort
            EndOffsetIteratorT d_end_offsets,
            cudaStream_t stream = 0)
   {
-    using DispatchT = DispatchSegmentedMergeSortSimple<false, KeyT, NullType, 
+    using DispatchT = DispatchSegmentedMergeSort<false, KeyT, NullType, 
                                                       BeginOffsetIteratorT, EndOffsetIteratorT, 
                                                       int>;
     
@@ -196,7 +196,7 @@ struct DeviceSegmentedMergeSort
                      EndOffsetIteratorT d_end_offsets,
                      cudaStream_t stream = 0)
   {
-    using DispatchT = DispatchSegmentedMergeSortSimple<true, KeyT, NullType, 
+    using DispatchT = DispatchSegmentedMergeSort<true, KeyT, NullType, 
                                                       BeginOffsetIteratorT, EndOffsetIteratorT, 
                                                       int>;
     

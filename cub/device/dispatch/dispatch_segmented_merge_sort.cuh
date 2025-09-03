@@ -28,31 +28,33 @@
 #pragma once
 
 #include <cub/agent/agent_segmented_merge_sort.cuh>
-#include <cub/detail/device_double_buffer.cuh>
-#include <cub/detail/temporary_storage.cuh>
 #include <cub/util_debug.cuh>
-#include <cub/util_deprecated.cuh>
 #include <cub/util_device.cuh>
 #include <cub/util_namespace.cuh>
 
 #include <thrust/system/cuda/detail/core/triple_chevron_launch.h>
 
-#include <type_traits>
-
 CUB_NAMESPACE_BEGIN
 
 /**
- * @brief Kernel for sorting segments using merge sort
+ * @brief Policy for segmented merge sort
+ */
+struct SegmentedMergeSortPolicy
+{
+  static constexpr int BLOCK_THREADS = 256;
+  static constexpr int ITEMS_PER_THREAD = 12;
+};
+
+/**
+ * @brief Kernel for sorting segments using BlockMergeSort
  */
 template <bool IS_DESCENDING,
-          typename ChainedPolicyT,
           typename KeyT,
           typename ValueT,
           typename BeginOffsetIteratorT,
           typename EndOffsetIteratorT,
-          typename OffsetT,
-          typename CompareOpT>
-__launch_bounds__(ChainedPolicyT::ActivePolicy::BLOCK_THREADS)
+          typename OffsetT>
+__launch_bounds__(SegmentedMergeSortPolicy::BLOCK_THREADS)
 __global__ void DeviceSegmentedMergeSortKernel(
     const KeyT *d_keys_in,
     KeyT *d_keys_out,
@@ -60,41 +62,30 @@ __global__ void DeviceSegmentedMergeSortKernel(
     ValueT *d_values_out,
     BeginOffsetIteratorT d_begin_offsets,
     EndOffsetIteratorT d_end_offsets,
-    int num_segments,
-    CompareOpT compare_op)
+    int num_segments)
 {
-  using ActivePolicyT = typename ChainedPolicyT::ActivePolicy;
-  using AgentSegmentedMergeSortT =
-    AgentSegmentedMergeSort<IS_DESCENDING,
-                            ActivePolicyT,
-                            KeyT,
-                            ValueT,
-                            OffsetT,
-                            CompareOpT>;
+  using AgentT = AgentSegmentedMergeSort<IS_DESCENDING,
+                                        SegmentedMergeSortPolicy,
+                                        KeyT,
+                                        ValueT,
+                                        OffsetT>;
 
   const unsigned int segment_id = blockIdx.x;
   
   if (segment_id >= num_segments)
-  {
     return;
-  }
 
+  // Get segment boundaries
   OffsetT segment_begin = d_begin_offsets[segment_id];
-  OffsetT segment_end   = d_end_offsets[segment_id];
-  OffsetT num_items     = segment_end - segment_begin;
-
-  if (num_items <= 0)
-  {
+  OffsetT segment_end = d_end_offsets[segment_id];
+  
+  if (segment_begin >= segment_end)
     return;
-  }
 
-  __shared__ typename AgentSegmentedMergeSortT::TempStorage temp_storage;
+  __shared__ typename AgentT::TempStorage temp_storage;
 
-  AgentSegmentedMergeSortT agent(num_items, temp_storage, compare_op);
-  agent.ProcessSegment(d_keys_in + segment_begin,
-                       d_keys_out + segment_begin,
-                       d_values_in + segment_begin,
-                       d_values_out + segment_begin);
+  AgentT agent(segment_begin, segment_end, temp_storage);
+  agent.ProcessSegment(d_keys_in, d_keys_out, d_values_in, d_values_out);
 }
 
 /**
@@ -105,90 +96,9 @@ template <bool IS_DESCENDING,
           typename ValueT,
           typename BeginOffsetIteratorT,
           typename EndOffsetIteratorT,
-          typename OffsetT,
-          typename CompareOpT>
+          typename OffsetT>
 struct DispatchSegmentedMergeSort
 {
-  //---------------------------------------------------------------------
-  // Tuning policies
-  //---------------------------------------------------------------------
-
-  /// SM35
-  struct Policy350
-  {
-    static constexpr int BLOCK_THREADS = 128;
-    static constexpr int ITEMS_PER_THREAD = 8;
-  };
-
-  /// SM70
-  struct Policy700 : Policy350
-  {
-    static constexpr int BLOCK_THREADS = 256;
-    static constexpr int ITEMS_PER_THREAD = 12;
-  };
-
-  /// SM80
-  struct Policy800 : Policy700
-  {
-    static constexpr int BLOCK_THREADS = 256;
-    static constexpr int ITEMS_PER_THREAD = 16;
-  };
-
-  /// SM90
-  struct Policy900 : Policy800
-  {
-    static constexpr int BLOCK_THREADS = 256;
-    static constexpr int ITEMS_PER_THREAD = 20;
-  };
-
-  /// Tuning policies of current PTX compiler pass
-  using PtxPolicy = Policy350;
-
-  // "Opaque" policies (whose parameterizations aren't reflected in the interface)
-  struct KernelConfig
-  {
-    int block_threads;
-    int items_per_thread;
-  };
-
-  //---------------------------------------------------------------------
-  // Tuning policies of current PTX compiler pass
-  //---------------------------------------------------------------------
-
-#if (CUB_PTX_ARCH >= 900)
-  using ActivePolicyT = Policy900;
-
-#elif (CUB_PTX_ARCH >= 800)
-  using ActivePolicyT = Policy800;
-
-#elif (CUB_PTX_ARCH >= 700)
-  using ActivePolicyT = Policy700;
-
-#else
-  using ActivePolicyT = Policy350;
-
-#endif
-
-  /// MaxPolicy
-  using MaxPolicy = Policy900;
-
-  /// Single-sweep kernel entry point
-  using KernelT = void (*)(const KeyT *,
-                          KeyT *,
-                          const ValueT *,
-                          ValueT *,
-                          BeginOffsetIteratorT,
-                          EndOffsetIteratorT,
-                          int,
-                          CompareOpT);
-
-  //---------------------------------------------------------------------
-  // Dispatch entrypoints
-  //---------------------------------------------------------------------
-
-  /**
-   * @brief Internal dispatch routine for computing a device-wide segmented merge sort
-   */
   CUB_RUNTIME_FUNCTION __forceinline__ static cudaError_t
   Dispatch(void *d_temp_storage,
            size_t &temp_storage_bytes,
@@ -198,121 +108,51 @@ struct DispatchSegmentedMergeSort
            int num_segments,
            BeginOffsetIteratorT d_begin_offsets,
            EndOffsetIteratorT d_end_offsets,
-           CompareOpT compare_op,
            cudaStream_t stream)
   {
+    (void)num_items; // Suppress unused parameter warning
     cudaError error = cudaSuccess;
 
     do
     {
-      // Get PTX version
-      int ptx_version = 0;
-      if (CubDebug(error = PtxVersion(ptx_version)))
-        break;
-
-      // Get kernel kernel dispatch configurations
-      KernelConfig config;
-      InitConfigs(ptx_version, config);
-
-      // Number of items per thread
-      int tile_size = config.block_threads * config.items_per_thread;
-
-      // Zero-size check
-      if (num_items == 0 || num_segments == 0)
-      {
-        if (d_temp_storage == nullptr)
-        {
-          temp_storage_bytes = 0;
-        }
-        break;
-      }
-
-      // For now, we don't need temporary storage for merge sort
-      // In future implementations, we might need it for multi-pass sorting
+      // No temp storage needed for simple case
+      temp_storage_bytes = 1; // Non-zero to indicate success
+      
+      // Return if the caller is simply requesting the size of temp storage
       if (d_temp_storage == nullptr)
-      {
-        temp_storage_bytes = 1;  // Minimal allocation
-        break;
-      }
+        return cudaSuccess;
 
-      // Log kernel configuration
-      #if defined(CUB_DETAIL_DEBUG_ENABLE_LOG)
-      _CubLog("Invoking DeviceSegmentedMergeSortKernel<<<%d, %d>>>(), "
-              "%d items per thread, %d SM occupancy\n",
-              num_segments,
-              config.block_threads,
-              config.items_per_thread,
-              1);
-      #endif
-
-      // Invoke kernel
+      // Launch kernel
       THRUST_NS_QUALIFIER::cuda_cub::launcher::triple_chevron(
-          num_segments,
-          config.block_threads,
-          0,
-          stream
+        num_segments,
+        SegmentedMergeSortPolicy::BLOCK_THREADS,
+        0,
+        stream
       ).doit(DeviceSegmentedMergeSortKernel<IS_DESCENDING,
-                                            MaxPolicy,
                                             KeyT,
                                             ValueT,
                                             BeginOffsetIteratorT,
                                             EndOffsetIteratorT,
-                                            OffsetT,
-                                            CompareOpT>,
+                                            OffsetT>,
              d_keys.Current(),
              d_keys.Alternate(),
              d_values.Current(),
              d_values.Alternate(),
              d_begin_offsets,
              d_end_offsets,
-             num_segments,
-             compare_op);
+             num_segments);
 
       // Check for failure to launch
       if (CubDebug(error = cudaPeekAtLastError()))
         break;
 
       // Sync the stream if specified to flush runtime errors
-      error = detail::DebugSyncStream(stream);
-      if (CubDebug(error))
+      if (CubDebug(error = SyncStream(stream)))
         break;
 
-      // Update selectors
-      d_keys.selector ^= 1;
-      d_values.selector ^= 1;
-    }
-    while (0);
+    } while (0);
 
     return error;
-  }
-
-  /**
-   * Initialize kernel dispatch configurations with the policies corresponding 
-   * to the PTX assembly we will use
-   */
-  CUB_RUNTIME_FUNCTION __forceinline__ static void
-  InitConfigs(int ptx_version, KernelConfig &config)
-  {
-    if (ptx_version >= 900)
-    {
-      config.block_threads = Policy900::BLOCK_THREADS;
-      config.items_per_thread = Policy900::ITEMS_PER_THREAD;
-    }
-    else if (ptx_version >= 800)
-    {
-      config.block_threads = Policy800::BLOCK_THREADS;
-      config.items_per_thread = Policy800::ITEMS_PER_THREAD;
-    }
-    else if (ptx_version >= 700)
-    {
-      config.block_threads = Policy700::BLOCK_THREADS;
-      config.items_per_thread = Policy700::ITEMS_PER_THREAD;
-    }
-    else
-    {
-      config.block_threads = Policy350::BLOCK_THREADS;
-      config.items_per_thread = Policy350::ITEMS_PER_THREAD;
-    }
   }
 };
 
